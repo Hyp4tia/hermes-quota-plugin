@@ -237,7 +237,7 @@ def _fetch_codex_with_models() -> QuotaResult:
     try:
         from agent.account_usage import (
             _resolve_codex_usage_credentials,
-            _resolve_codex_usage_url,
+            _codex_backend_urls,
         )
     except Exception:
         return build_unavailable("openai-codex", "fetcher-unavailable")
@@ -254,7 +254,7 @@ def _fetch_codex_with_models() -> QuotaResult:
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
         with httpx.Client(timeout=15.0) as client:
-            response = client.get(_resolve_codex_usage_url(base_url), headers=headers)
+            response = client.get(_codex_backend_urls(base_url)[0], headers=headers)
             response.raise_for_status()
         payload = response.json() or {}
     except Exception:
