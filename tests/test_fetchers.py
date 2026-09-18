@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import types
 import unittest
+import urllib.error
 from io import BytesIO
 from unittest import mock
 
@@ -326,6 +328,289 @@ class KimiFetcherTests(unittest.TestCase):
         with mock.patch.object(kimi, "_load_creds", return_value=(None, None)):
             res = kimi.fetch_kimi_quota()
         self.assertEqual(res.unavailable_reason, "no-credentials")
+
+
+# -- CommandCode --------------------------------------------------------------
+
+
+class CommandCodeFetcherTests(unittest.TestCase):
+    """CommandCode balances are credit-based; windows must never be invented."""
+
+    # Live shapes (CLI 1.53.0): the rolling windows and the plan id sit under
+    # `credits`, the subscription carries the billing period.
+    _CREDITS = {
+        "credits": {
+            "planId": "individual-goat",
+            "belowThreshold": False,
+            "creditThreshold": 0,
+            "monthlyCredits": 60.0,
+            "purchasedCredits": 0,
+            "freeCredits": 0,
+            "windowLimits": {
+                "limited": True,
+                "exceeded": None,
+                "fiveHour": {"used": 3.5, "cap": 14, "exceeded": False, "resetAt": 1789700413797},
+                "weekly": {"used": 7.0, "cap": 35, "exceeded": False, "resetAt": 1789756647895},
+            },
+        },
+    }
+    # Older payload: the windows sit beside `credits`, and only the subscription
+    # reports a plan id.
+    _CREDITS_LEGACY = {
+        "credits": {"monthlyCredits": 60.0, "purchasedCredits": 0, "freeCredits": 0},
+        "windowLimits": _CREDITS["credits"]["windowLimits"],
+    }
+    _SUBSCRIPTION = {
+        "success": True,
+        "data": {
+            "status": "active",
+            "planId": "individual-goat",
+            "currentPeriodStart": "2026-09-11T18:36:24.000Z",
+            "currentPeriodEnd": "2026-10-11T18:36:24.000Z",
+        },
+    }
+    _SUMMARY = {"totalCost": 8.95, "totalCount": 3086, "totalTokens": 329663340}
+    _WHOAMI = {"org": {"id": "org_123", "login": "acme"}, "orgLimits": []}
+
+    def _run(self, credits=None, sub=None, summary=None, whoami=None, key="cmd_test",
+             delays=None, deadline=None):
+        from quota_providers import commandcode
+
+        payloads = {
+            "/alpha/billing/credits": self._CREDITS if credits is None else credits,
+            "/alpha/billing/subscriptions": self._SUBSCRIPTION if sub is None else sub,
+            "/alpha/usage/summary": self._SUMMARY if summary is None else summary,
+            "/alpha/whoami": self._WHOAMI if whoami is None else whoami,
+        }
+        delays = delays or {}
+        calls: list[dict] = []
+
+        def _fake_get(path, _key, params=None, timeout=None):  # noqa: ANN001, ARG001
+            entry = {"path": path, "params": dict(params or {}), "start": time.monotonic()}
+            calls.append(entry)
+            time.sleep(delays.get(path, 0))
+            entry["end"] = time.monotonic()
+            value = payloads[path]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        patchers = [
+            mock.patch.object(commandcode, "_load_api_key", return_value=key),
+            mock.patch.object(commandcode, "_get", side_effect=_fake_get),
+        ]
+        if deadline is not None:
+            patchers.append(mock.patch.object(commandcode, "_DEADLINE_S", deadline))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return commandcode.fetch_commandcode_quota(), calls
+
+    def _fetch_with(self, **kwargs):
+        return self._run(**kwargs)[0]
+
+    # -- plan catalogue -------------------------------------------------------
+
+    def test_plan_catalog_matches_the_cli_table(self):
+        # Mirror of getPlanTotalCredits in Command Code's own CLI: two Pro ids
+        # ($30 first-gen, $80 current), plus the real Max/Ultra/Teams ids.
+        from quota_providers.commandcode import _PLANS
+
+        self.assertEqual(
+            _PLANS,
+            {
+                "individual-go": ("Go", 10.0),
+                "individual-goat": ("GOAT", 70.0),
+                "individual-pro": ("Pro", 30.0),
+                "individual-pro-v1": ("Pro", 80.0),
+                "individual-provider": ("Provider", 15.0),
+                "individual-max": ("Max", 150.0),
+                "individual-ultra": ("Ultra", 300.0),
+                "teams-pro": ("Teams Pro", 40.0),
+            },
+        )
+
+    def test_legacy_pro_pool_is_thirty(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["planId"] = "individual-pro"
+        credits["credits"]["monthlyCredits"] = 20.0
+        res = self._fetch_with(credits=credits)
+        self.assertEqual(res.plan, "Pro")
+        by_label = {w.label: w for w in res.windows}
+        self.assertAlmostEqual(by_label["Cycle"].used_percent, (30.0 - 20.0) / 30.0 * 100.0, places=2)
+        self.assertIn("$20.00 of $30.00 cycle credits left", "\n".join(res.details))
+
+    def test_pro_v1_pool_is_eighty(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"].pop("planId")  # plan id only on the subscription
+        sub = json.loads(json.dumps(self._SUBSCRIPTION))
+        sub["data"]["planId"] = "individual-pro-v1"
+        res = self._fetch_with(credits=credits, sub=sub)
+        self.assertEqual(res.plan, "Pro")
+        by_label = {w.label: w for w in res.windows}
+        self.assertAlmostEqual(by_label["Cycle"].used_percent, (80.0 - 60.0) / 80.0 * 100.0, places=2)
+
+    def test_unknown_suffix_never_borrows_another_pools_pool(self):
+        # `individual-pro-v2` must NOT inherit the legacy $30 pool: a wrong
+        # denominator is worse than no Cycle window.
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["planId"] = "individual-pro-v2"
+        res = self._fetch_with(credits=credits)
+        self.assertIsNone(res.plan)
+        self.assertNotIn("Cycle", {w.label for w in res.windows})
+        self.assertIn("Unrecognized plan id: individual-pro-v2", "\n".join(res.details))
+
+    def test_plan_id_lookup_tolerates_case_and_underscores(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["planId"] = "Individual_Pro_V1"
+        credits["credits"]["monthlyCredits"] = 60.0
+        res = self._fetch_with(credits=credits)
+        self.assertEqual(res.plan, "Pro")
+        by_label = {w.label: w for w in res.windows}
+        used = by_label["Cycle"].used_percent
+        self.assertIsNotNone(used)
+        self.assertAlmostEqual(used, (80.0 - 60.0) / 80.0 * 100.0, places=2)
+
+    def test_balance_above_the_pool_drops_the_cycle_percent(self):
+        # Rollover/carry-over: the pool stops being a denominator worth showing.
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["planId"] = "individual-goat"
+        credits["credits"]["monthlyCredits"] = 95.0
+        res = self._fetch_with(credits=credits)
+        self.assertNotIn("Cycle", {w.label for w in res.windows})
+        self.assertIn("Cycle credits left: $95.00 (pool $70.00)", "\n".join(res.details))
+
+    def test_unknown_plan_gets_no_name_and_no_cycle_percent(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"].pop("planId")
+        sub = json.loads(json.dumps(self._SUBSCRIPTION))
+        sub["data"]["planId"] = "individual-future"
+        res = self._fetch_with(credits=credits, sub=sub)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertNotIn("Cycle", {w.label for w in res.windows})
+        joined = "\n".join(res.details)
+        self.assertIn("Cycle credits left: $60.00", joined)
+        self.assertIn("Unrecognized plan id: individual-future", joined)
+
+    # -- window shapes --------------------------------------------------------
+
+    def test_windows_and_details_from_the_live_shape(self):
+        res = self._fetch_with()
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "GOAT")
+        by_label = {w.label: w for w in res.windows}
+        self.assertEqual(set(by_label), {"5h", "Weekly", "Cycle"})
+        self.assertAlmostEqual(by_label["5h"].used_percent, 25.0, places=2)
+        self.assertAlmostEqual(by_label["Weekly"].used_percent, 20.0, places=2)
+        self.assertAlmostEqual(by_label["Cycle"].used_percent, (70.0 - 60.0) / 70.0 * 100.0, places=2)
+        self.assertTrue(by_label["Cycle"].reset_at.startswith("2026-10-11T18:36:24"))
+        joined = "\n".join(res.details)
+        self.assertIn("$60.00 of $70.00 cycle credits left", joined)
+        self.assertIn("Cycle so far: $8.95 spent · 3,086 requests · 329.7M tokens", joined)
+
+    def test_window_limits_beside_credits_still_supported(self):
+        res = self._fetch_with(credits=self._CREDITS_LEGACY)
+        by_label = {w.label: w for w in res.windows}
+        self.assertTrue({"5h", "Weekly"} <= set(by_label))
+        self.assertAlmostEqual(by_label["5h"].used_percent, 25.0, places=2)
+
+    def test_exceeded_window_is_named(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["windowLimits"]["fiveHour"]["exceeded"] = True
+        res = self._fetch_with(credits=credits)
+        self.assertIn("5h window exceeded", "\n".join(res.details))
+
+    def test_pay_as_you_go_has_no_window_percents(self):
+        credits = json.loads(json.dumps(self._CREDITS))
+        credits["credits"]["windowLimits"] = {"limited": False, "exceeded": None}
+        res = self._fetch_with(credits=credits)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertNotIn("5h", {w.label for w in res.windows})
+        self.assertIn("pay-as-you-go", "\n".join(res.details))
+
+    # -- org scope ------------------------------------------------------------
+
+    def test_org_scope_is_applied_to_every_billing_call(self):
+        res, calls = self._run()
+        params = {c["path"]: c["params"] for c in calls}
+        self.assertEqual(params["/alpha/whoami"], {"limits": "1"})
+        self.assertEqual(params["/alpha/billing/credits"], {"orgId": "org_123"})
+        self.assertEqual(params["/alpha/billing/subscriptions"], {"orgId": "org_123"})
+        self.assertEqual(
+            params["/alpha/usage/summary"],
+            {"orgId": "org_123", "since": "2026-09-11T18:36:24.000Z"},
+        )
+        self.assertIn("Cycle so far", "\n".join(res.details))
+
+    def test_individual_account_still_scopes_the_summary_to_the_cycle(self):
+        res, calls = self._run(whoami={})
+        params = {c["path"]: c["params"] for c in calls}
+        self.assertIsNone(params["/alpha/billing/credits"]["orgId"])
+        self.assertEqual(params["/alpha/usage/summary"]["since"], "2026-09-11T18:36:24.000Z")
+        self.assertIn("Cycle so far", "\n".join(res.details))
+
+    def test_unscoped_summary_is_not_labelled_cycle_so_far(self):
+        sub = json.loads(json.dumps(self._SUBSCRIPTION))
+        sub["data"].pop("currentPeriodStart")
+        res, calls = self._run(sub=sub)
+        params = {c["path"]: c["params"] for c in calls}
+        self.assertIsNone(params["/alpha/usage/summary"]["since"])
+        joined = "\n".join(res.details)
+        self.assertNotIn("Cycle so far", joined)
+        self.assertIn("Usage so far (all time)", joined)
+
+    # -- budget + failure modes ----------------------------------------------
+
+    def test_billing_calls_are_issued_together(self):
+        _, calls = self._run(delays={"/alpha/billing/credits": 0.2,
+                                     "/alpha/billing/subscriptions": 0.2})
+        by_path = {c["path"]: c for c in calls}
+        credits = by_path["/alpha/billing/credits"]
+        subs = by_path["/alpha/billing/subscriptions"]
+        # Overlapping intervals: sequential calls cannot overlap.
+        self.assertLess(subs["start"], credits["end"])
+        self.assertLess(credits["start"], subs["end"])
+
+    def test_a_hung_call_cannot_outrun_the_provider_deadline(self):
+        started = time.monotonic()
+        res = self._fetch_with(
+            delays={"/alpha/billing/subscriptions": 0.6, "/alpha/usage/summary": 0.6},
+            deadline=0.15,
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("5h", {w.label for w in res.windows})
+        self.assertNotIn("Cycle so far", "\n".join(res.details))
+
+    def test_no_credentials(self):
+        res = self._fetch_with(key=None)
+        self.assertEqual(res.unavailable_reason, "no-credentials")
+
+    def test_auth_failure_is_reported(self):
+        # HTTPError is an OSError subclass; build one the way urlopen raises it.
+        err = urllib.error.HTTPError("https://api.commandcode.ai/x", 401, "Unauthorized", {}, None)
+        res = self._fetch_with(credits=err)
+        self.assertEqual(res.unavailable_reason, "auth-failed")
+
+    def test_supporting_calls_failing_keeps_windows(self):
+        res = self._fetch_with(sub=RuntimeError("boom"), summary=RuntimeError("boom"))
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual({w.label for w in res.windows}, {"5h", "Weekly", "Cycle"})
+        self.assertEqual(res.plan, "GOAT")
+
+    def test_garbage_credits_payload_is_bad_json(self):
+        res = self._fetch_with(credits=["not", "an", "object"])
+        self.assertEqual(res.unavailable_reason, "bad-json")
+
+    def test_fetcher_never_raises(self):
+        # An unexpected blow-up inside the body must still return a card.
+        from quota_providers import commandcode
+
+        with mock.patch.object(commandcode, "_load_api_key", return_value="k"), \
+                mock.patch.object(commandcode, "_get", side_effect=ValueError("boom")):
+            res = commandcode.fetch_commandcode_quota()
+        self.assertEqual(res.unavailable_reason, "fetch-error:ValueError")
 
 
 # -- Base ---------------------------------------------------------------------

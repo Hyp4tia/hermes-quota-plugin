@@ -135,6 +135,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `openrouter` | API key | Balance/credits style detail lines |
 | `opencode-go` | API key | See the OpenCode note below |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
+| `commandcode` | CLI auth (`~/.commandcode`) | Rolling **5h**/**Weekly** caps, **Cycle** pool against the plan's monthly credits, cycle spend/requests |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
