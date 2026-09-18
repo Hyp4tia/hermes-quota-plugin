@@ -274,6 +274,14 @@ const PROVIDER_SVGS = {
 		viewBox: "0 0 24 24",
 		body: '<path d="M6.469 8.776L16.512 23h-4.464L2.005 8.776H6.47zm-.004 7.9l2.233 3.164L6.467 23H2l4.465-6.324zM22 2.582V23h-3.659V7.764L22 2.582zM22 1l-9.952 14.095-2.233-3.163L17.533 1H22z"></path>',
 	},
+	// OpenCode is not in @lobehub/icons as the real mark — its mono entry is the
+	// bare outline, which reads as a generic square. This is the official badge
+	// geometry (opencode.ai favicon): frame with the inner block, one path,
+	// nonzero winding punch the opening.
+	"opencode-go": {
+		viewBox: "0 0 24 24",
+		body: '<path d="M4 2h16v20H4zM8 6v12h8V6zM8 10h8v8H8z"></path>',
+	},
 	copilot: {
 		// GitHub mark — octicons/mark-github (MIT), inlined like the others.
 		viewBox: "0 0 16 16",
