@@ -45,6 +45,13 @@ import { jsx, jsxs } from "react/jsx-runtime";
 
 const ID = "quota";
 
+// This widget's build. It must equal `version:` in plugin.yaml — the desktop app
+// loads the widget from the CLIENT machine while `cli.exec` runs against the
+// gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
+// fails when they drift; a mismatch found at runtime is surfaced in the pane
+// instead of looking like a broken feature.
+const WIDGET_VERSION = "2.3.3";
+
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
 
@@ -277,12 +284,14 @@ const PROVIDER_SVGS = {
 	// Official OpenCode mark (https://opencode.ai/brand). The brand asset's own
 	// coordinates, scaled 2:3 into this viewBox: frame 24x30 @(0,6) → 16x20 @(4,2),
 	// opening 12x18 @(6,12) → 8x12 @(8,6), inner block 12x12 @(6,18) → 8x8 @(8,10).
-	// The brand draws the block a tone brighter than the frame; the frame's 0.5
-	// opacity keeps that two-tone hierarchy instead of flattening the mark into a
-	// solid square. @lobehub/icons ships only the bare outline for this one.
+	// Tone order comes from the asset: on its dark tile the FRAME is the bright
+	// element (white) and the inner block is the dimmer one (#5A5858) — so the
+	// frame stays at full opacity and the block carries the 0.5. Rendering it the
+	// other way inverts the mark against the vendor's own icon. @lobehub/icons
+	// ships only the bare outline for this one.
 	"opencode-go": {
 		viewBox: "0 0 24 24",
-		body: '<path opacity="0.5" d="M4 2h16v20H4zM8 6v12h8V6z"></path><path d="M8 10h8v8H8z"></path>',
+		body: '<path d="M4 2h16v20H4zM8 6v12h8V6z"></path><path opacity="0.5" d="M8 10h8v8H8z"></path>',
 	},
 	copilot: {
 		// The Copilot glyph from @lobehub/icons — NOT the GitHub mark this entry
@@ -456,6 +465,14 @@ function useNow(intervalMs = 30_000) {
 	return now;
 }
 
+/** Compact age label for the "data is N old" footer line. */
+function formatAgeSeconds(seconds) {
+	if (!Number.isFinite(seconds)) return "";
+	if (seconds < 60) return `${Math.round(seconds)}s`;
+	if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+	return `${Math.floor(seconds / 3600)}h`;
+}
+
 // ---- update self-check (like Hermes's own) ---------------------------------
 
 const REPO_API_LATEST =
@@ -466,24 +483,16 @@ const REPO_API_LATEST =
 // entry is bound to the stamp it was taken with (`seen`) — so installing
 // a new version invalidates it immediately instead of serving a stale
 // "update available" verdict for the rest of the hour.
-function useUpdateCheck() {
+function useUpdateCheck(installedSha) {
 	const [update, setUpdate] = useState(null);
 	useEffect(() => {
 		let alive = true;
 		const CHECK_KEY = "updateCheck";
 		const ONE_HOUR = 60 * 60 * 1000;
 		const run = async () => {
-			let installedSha = null;
-			try {
-				const result = await host.request("cli.exec", {
-					argv: ["quota", "status", "--version-json"],
-				});
-				if (!result?.blocked && result?.code === 0 && result.output) {
-					installedSha = JSON.parse(result.output).installed_sha || null;
-				}
-			} catch {
-				/* not stamped (older install) — skip check */
-			}
+			// The stamp rides on the status payload — no second CLI spawn on
+			// mount, which is what made a reload (or a gateway switch, where
+			// every plugin re-mounts) feel sluggish.
 			if (!installedSha || installedSha === "unknown") return;
 			// Throttle: at most one GitHub call per hour. The cached verdict
 			// is only valid for the installed stamp it was taken with — a
@@ -538,7 +547,7 @@ function useUpdateCheck() {
 		return () => {
 			alive = false;
 		};
-	}, []);
+	}, [installedSha]);
 	return update;
 }
 
@@ -563,30 +572,89 @@ function UpdateBanner({ update }) {
 }
 
 // ---- data hook (cli.exec instead of REST) ----------------------------------
+//
+// Two-phase by design. The POLL reads the backend cache (`--cached`, never the
+// network), so the configured interval IS the cadence; the refresh is fired
+// out-of-band. Blocking the poll on a provider fetch is what stretched a 60s
+// setting to 100-200s (providers ran one after another, and one flaky endpoint
+// held the whole sweep). The last payload is kept in storage, so a plugin
+// reload or a gateway switch paints from it immediately instead of waiting for
+// a CLI spawn.
+
+const QUOTA_QUERY_KEY = ["quota", "widget"];
+const SNAPSHOT_KEY = "lastPayload";
+const CLI_TIMEOUT_MS = 15_000;
+let _refreshInFlight = false;
+
+function readSnapshot() {
+	try {
+		const raw = CTX.storage.get(SNAPSHOT_KEY);
+		const parsed = raw ? JSON.parse(raw) : null;
+		return parsed && typeof parsed === "object" ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeSnapshot(data) {
+	try {
+		CTX.storage.set(SNAPSHOT_KEY, JSON.stringify(data));
+	} catch {
+		/* storage unavailable — the poll still works, just no instant paint */
+	}
+}
+
+/** One CLI call that can never hang the UI: a gateway switch leaves the
+ *  previous request sitting on a dead socket, and without a deadline the pane
+ *  waits it out instead of failing over to the new gateway. */
+async function quotaCli(argv, timeoutMs = CLI_TIMEOUT_MS) {
+	let timer = null;
+	try {
+		const result = await Promise.race([
+			host.request("cli.exec", { argv }),
+			new Promise((_resolve, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("quota cli timeout")),
+					timeoutMs,
+				);
+			}),
+		]);
+		if (result?.blocked || result?.code !== 0) {
+			throw new Error(result?.hint || result?.output || "quota cli failed");
+		}
+		return result;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+/** Out-of-band refresh: at most one in flight, never awaited by the UI. */
+async function refreshQuotaCache() {
+	if (_refreshInFlight) return false;
+	_refreshInFlight = true;
+	try {
+		await quotaCli(["quota", "refresh"]);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		_refreshInFlight = false;
+	}
+}
 
 function useQuota() {
-	const intervalMs = useValue(refreshIntervalAtom) * 1000;
+	const qc = useQueryClient();
+	const intervalSec = useValue(refreshIntervalAtom);
+	const intervalMs = Math.max(5, intervalSec) * 1000;
 	return useQuery({
-		queryKey: ["quota", "widget"],
+		queryKey: QUOTA_QUERY_KEY,
 		queryFn: async () => {
-			// Call Hermes CLI via the desktop gateway. --max-age makes the
-			// backend re-fetch providers when the cache is older than our
-			// poll interval, so the configured cadence actually refreshes.
-			const maxAge = Math.max(10, Math.floor(intervalMs / 1000));
-			const result = await host.request("cli.exec", {
-				argv: [
-					"quota",
-					"status",
-					"--json",
-					"--max-age",
-					String(maxAge),
-				],
-			});
-			if (result?.blocked || result?.code !== 0) {
-				throw new Error(
-					result?.hint || result?.output || "quota status failed",
-				);
-			}
+			const result = await quotaCli([
+				"quota",
+				"status",
+				"--json",
+				"--cached",
+			]);
 			// CLI prints JSON to stdout; parse it
 			let data;
 			try {
@@ -594,10 +662,27 @@ function useQuota() {
 			} catch {
 				data = {};
 			}
+			writeSnapshot(data);
+			// Missing age (no cache yet on this gateway) counts as stale.
+			const rawAge = data ? data.age_s : null;
+			const stale =
+				rawAge == null ||
+				!Number.isFinite(Number(rawAge)) ||
+				Number(rawAge) > intervalSec;
+			// Fire the refresh off the poll path and update when it lands.
+			if (stale) {
+				void refreshQuotaCache().then((refreshed) => {
+					if (refreshed) qc.invalidateQueries({ queryKey: QUOTA_QUERY_KEY });
+				});
+			}
 			return data;
 		},
+		placeholderData: readSnapshot(),
 		refetchInterval: intervalMs,
-		staleTime: Math.max(10_000, Math.floor(intervalMs / 2)),
+		// The user asked for this cadence; honour it while the window is
+		// unfocused instead of silently pausing the poll.
+		refetchIntervalInBackground: true,
+		staleTime: Math.max(5_000, Math.floor(intervalMs / 2)),
 		retry: 1,
 	});
 }
@@ -1001,6 +1086,7 @@ function RefreshIntervalControl() {
 				className: "text-[0.625rem] text-(--ui-text-quaternary)",
 				children: t(
 					"refreshIntervalHint",
+					seconds,
 					REFRESH_INTERVAL_MIN,
 					REFRESH_INTERVAL_MAX,
 				),
@@ -1132,7 +1218,31 @@ function QuotaPane() {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading, refetch } = useQuota();
-	const update = useUpdateCheck();
+	const update = useUpdateCheck(data && data.installed_sha);
+	// Footer honesty: the backend reports the cache age (authoritative across
+	// machines, no clock skew), the ticker keeps it live, and the configured
+	// cadence is shown next to it so "60s" is verifiable at a glance.
+	const nowTick = useNow(5_000);
+	const receivedAt = useRef(Date.now());
+	const pollSeconds = useValue(refreshIntervalAtom);
+	useEffect(() => {
+		receivedAt.current = Date.now();
+	}, [data]);
+	const ageSeconds = (() => {
+		const base = Number(data && data.age_s);
+		if (!Number.isFinite(base)) return null;
+		return Math.max(0, Math.round(base + (nowTick - receivedAt.current) / 1000));
+	})();
+	// Backend and widget ship separately (gateway vs the machine running the
+	// app), so say it out loud when they are not the same build.
+	const versionSkew =
+		data && data.plugin_version && data.plugin_version !== WIDGET_VERSION
+			? jsx("div", {
+					className:
+						"rounded-lg border border-dashed border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2 text-[0.6875rem] text-(--ui-text-secondary)",
+					children: t("versionSkew", WIDGET_VERSION, data.plugin_version),
+				})
+			: null;
 	const refresh = useMutation({
 		mutationFn: async () => {
 			const result = await host.request("cli.exec", {
@@ -1286,13 +1396,18 @@ function QuotaPane() {
 			}),
 			jsx("div", { className: "min-h-0 flex-1", children: body }),
 			jsx(UpdateBanner, { update }),
+			versionSkew,
 			data && data.fetched_at
 				? jsx("div", {
 						className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
-						children: t(
-							"fetched",
-							absoluteReset(data.fetched_at) || data.fetched_at,
-						),
+						children:
+							t(
+								"fetched",
+								absoluteReset(data.fetched_at) || data.fetched_at,
+							) +
+							(ageSeconds == null
+								? ""
+								: ` · ${t("fetchedAge", formatAgeSeconds(ageSeconds), pollSeconds)}`),
 					})
 				: null,
 		],
@@ -1362,6 +1477,9 @@ export default {
 				noDataSection: (n) => `No data (${n}) — click to expand`,
 				reset: (when) => `reset ${when}`,
 				fetched: (when) => `fetched ${when}`,
+				fetchedAge: (age, interval) => `${age} old · poll ${interval}s`,
+				versionSkew: (widget, backend) =>
+					`Widget v${widget} · backend v${backend} — reload desktop plugins (or restart the app) to line them up.`,
 				resetFormatLabel: "Reset format",
 				relative: "Relative",
 				absolute: "Absolute",
@@ -1379,8 +1497,8 @@ export default {
 				showDockedPaneLabel: "Show docked quota pane",
 				settingsButton: "Settings",
 				refreshIntervalLabel: "Refresh interval",
-				refreshIntervalHint: (min, max) =>
-					`Polls every ${min}–${max}s. Bar and pane update live.`,
+				refreshIntervalHint: (seconds, min, max) =>
+					`Reads the cache every ${seconds}s (${min}–${max}s). Refreshes run in the background, so the cadence stays exact.`,
 				seconds: "s",
 				disabledProvidersLabel: "Enabled providers",
 				disableTooltip: "Disable this provider",

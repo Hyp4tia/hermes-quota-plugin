@@ -121,15 +121,47 @@ def _render_quota(provider_filter: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _plugin_stamp() -> dict[str, Any]:
+    """Installed build info for the widget (manifest version + commit stamp).
+
+    Read here, not in the widget, so a mount costs ONE ``cli.exec`` instead of
+    two — the extra round-trip was part of the slow reload after a gateway
+    switch.
+    """
+    out: dict[str, Any] = {"plugin_version": None, "installed_sha": None}
+    root = Path(__file__).resolve().parent
+    try:
+        for line in (root / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                out["plugin_version"] = line.split(":", 1)[1].strip().strip("'\"")
+                break
+    except OSError:
+        pass
+    try:
+        stamp = json.loads((root / "version.json").read_text(encoding="utf-8"))
+        if isinstance(stamp, dict):
+            out["installed_sha"] = stamp.get("installed_sha")
+    except (OSError, ValueError):
+        pass
+    return out
+
+
 def _render_quota_json() -> str:
-    """Render the full quota cache as JSON for the desktop widget."""
+    """Render the full quota cache as JSON for the desktop widget.
+
+    Carries the cache age and the installed build stamp alongside the data so
+    the widget can poll the cache (never the network), schedule its own refresh,
+    and compare versions without further round-trips.
+    """
     cache = read_quota_cache()
     # Ensure consistent shape for widget consumption
     providers = cache.get("providers") or {}
     out = {
         "fetched_at": cache.get("fetched_at"),
         "providers": providers,
+        "age_s": quota_cache_age_seconds(),
     }
+    out.update(_plugin_stamp())
     return json.dumps(out, indent=2, sort_keys=True)
 
 
@@ -181,6 +213,11 @@ def setup_argparse(subparser):
         default=None,
         help="Refresh automatically when the cache is older than N seconds",
     )
+    status_p.add_argument(
+        "--cached",
+        action="store_true",
+        help="Never refresh: emit the cache as-is (desktop widget poll path)",
+    )
     subs.add_parser("refresh", help="Force a re-fetch of all providers")
     prov = subs.add_parser("provider", help="Show quota for one provider")
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
@@ -202,16 +239,20 @@ def _handle_cli(args):
         print(_render_quota(cmd))
         return
     if cmd == "status" and getattr(args, "json", False):
-        # Widget path: honor its poll cadence — refresh when the cache is
-        # older than the requested max age (defaults to MAX_AGE_S).
-        max_age = getattr(args, "max_age", None)
-        if max_age is None or max_age <= 0:
-            max_age = MAX_AGE_S
-        if (quota_cache_age_seconds() or 10**9) > max_age:
-            try:
-                refresh_quota_cache()
-            except Exception:
-                pass
+        # Two readers share this payload:
+        #  * the widget polls with --cached and wants the cache NOW; its refresh
+        #    runs out-of-band so the poll cadence stays exact (blocking the poll
+        #    on a provider fetch is what stretched a 60s interval past 100s);
+        #  * a plain call with --max-age blocks until the cache is fresh enough.
+        if not getattr(args, "cached", False):
+            max_age = getattr(args, "max_age", None)
+            if max_age is None or max_age <= 0:
+                max_age = MAX_AGE_S
+            if (quota_cache_age_seconds() or 10**9) > max_age:
+                try:
+                    refresh_quota_cache()
+                except Exception:
+                    pass
         print(_render_quota_json())
         return
     if cmd == "status" and getattr(args, "version_json", False):

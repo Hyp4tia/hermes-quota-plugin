@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -53,6 +54,11 @@ _CACHE_FILENAME = "quota_cache.json"
 _CACHE_LOCK = threading.Lock()
 # 30 minutes — footer drops stale data. Also used by CLI/quota command for staleness.
 MAX_AGE_S = 60 * 30
+# Wall-clock budget for one sweep. The widget polls the cache on a fixed cadence,
+# and a sweep that overran that interval is what made a configured 60s refresh
+# land 100-200s late. Providers run concurrently and the whole sweep is capped
+# here, so the poll path can never be stretched by one slow provider.
+REFRESH_BUDGET_S = 20.0
 
 
 def _cache_path() -> str:
@@ -101,36 +107,71 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     }
 
 
-def refresh_quota_cache(*, timeout: float = 12.0) -> dict[str, Any]:
-    """Run every registered provider fetcher and write the cache file.
+def _unavailable_record(provider_id: str, reason: str) -> dict[str, Any]:
+    return {
+        "label": provider_id,
+        "plan": None,
+        "unavailable_reason": reason,
+        "details": [],
+        "windows": [],
+    }
 
-    Fail-open per provider: a fetcher that raises or returns no data leaves an
-    ``unavailable_reason`` record rather than aborting the whole refresh.
+
+def _fetch_one(provider_id: str, fetcher: Any) -> dict[str, Any]:
+    """Run one fetcher. Fail-open by contract — never raises."""
+    try:
+        res = fetcher()
+    except Exception:
+        logger.debug("quota_cache ▸ fetcher %s crashed", provider_id, exc_info=True)
+        return _unavailable_record(provider_id, "fetch-error")
+    if res is None:
+        return _unavailable_record(provider_id, "no-data")
+    return _result_to_record(res)
+
+
+def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
+    """Run every registered provider fetcher concurrently and write the cache.
+
+    Bounded by ``budget`` seconds (``REFRESH_BUDGET_S`` default) and run on
+    daemon threads, so one hung provider can neither stretch the call nor hold
+    the short-lived CLI process open: whatever finished is written, the rest is
+    recorded as ``timeout`` and keeps its previous value. Fail-open per
+    provider: a fetcher that raises, returns nothing, or misses the deadline
+    leaves an ``unavailable_reason`` record rather than aborting the sweep.
     Returns the cache dict that was written.
     """
-    providers: dict[str, Any] = {}
-    for provider_id, fetcher in PROVIDER_FETCHERS.items():
-        try:
-            res = fetcher()  # type: ignore[operator]
-            if res is None:
-                providers[provider_id] = {
-                    "label": provider_id,
-                    "plan": None,
-                    "unavailable_reason": "no-data",
-                    "details": [],
-                    "windows": [],
-                }
-            else:
-                providers[provider_id] = _result_to_record(res)
-        except Exception:
-            logger.debug("quota_cache ▸ fetcher %s crashed", provider_id, exc_info=True)
-            providers[provider_id] = {
-                "label": provider_id,
-                "plan": None,
-                "unavailable_reason": "fetch-error",
-                "details": [],
-                "windows": [],
-            }
+    budget_s = REFRESH_BUDGET_S if budget is None else max(0.0, float(budget))
+    items = list(PROVIDER_FETCHERS.items())
+    results: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def _worker(pid: str, fetcher: Any, event: threading.Event) -> None:
+        record = _fetch_one(pid, fetcher)
+        with lock:
+            results[pid] = record
+        event.set()
+
+    events: dict[str, threading.Event] = {}
+    for provider_id, fetcher in items:
+        event = threading.Event()
+        events[provider_id] = event
+        threading.Thread(
+            target=_worker,
+            args=(provider_id, fetcher, event),
+            name=f"quota-fetch-{provider_id}",
+            daemon=True,
+        ).start()
+
+    deadline = time.monotonic() + budget_s
+    for event in events.values():
+        event.wait(max(0.0, deadline - time.monotonic()))
+
+    with lock:
+        providers: dict[str, Any] = {
+            provider_id: results.get(provider_id)
+            or _unavailable_record(provider_id, "timeout")
+            for provider_id, _fetcher in items
+        }
 
     cache = {"fetched_at": datetime.now(timezone.utc).isoformat(), "providers": providers}
 
