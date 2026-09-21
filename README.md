@@ -4,12 +4,10 @@ Per-provider quota and rate limits, live in Hermes Desktop — a **status-bar ch
 a **docked pane**, a **`/quota` page** and a **CLI**, all fed by a local cache so
 the UI never does network I/O of its own.
 
-![Quota pane](docs/images/quota-pane.png)
+![Quota in Hermes Desktop](docs/images/quota-app.png)
 
 The pane docks on the right of Hermes Desktop; the chip sits in the status bar at
 the bottom, next to the client/backend version label:
-
-![Quota in Hermes Desktop](docs/images/quota-app.png)
 
 **Contents** — [Install](#install) · [What you get](#what-you-get) ·
 [Providers](#providers) · [How it works](#how-it-works) ·
@@ -79,6 +77,8 @@ called out in the pane (see [Troubleshooting](#troubleshooting)).
 Reachable three ways: the **docked pane** (`Placement: right`, 300px, toggled in
 Settings), the **`/quota` route** and the **sidebar nav row** (`Quota`, pulse
 icon).
+
+![Quota pane](docs/images/quota-pane.png)
 
 - One card per provider with the official brand icon, a tonal progress bar, the
   plan badge and per-window rows.
